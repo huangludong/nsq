@@ -1,4 +1,4 @@
-package main
+package nsqd
 
 // the core algorithm here was borrowed from:
 // Blake Mizerany's `noeqd` https://github.com/bmizerany/noeqd
@@ -6,64 +6,74 @@ package main
 // Twitter's `snowflake` https://github.com/twitter/snowflake
 
 // only minor cleanup and changes to introduce a type, combine the concept
-// of workerId + datacenterId into a single identifier, and modify the
+// of workerID + datacenterId into a single identifier, and modify the
 // behavior when sequences rollover for our specific implementation needs
 
 import (
 	"encoding/hex"
 	"errors"
-	"github.com/bitly/nsq/nsq"
 	"time"
 )
 
 const (
-	workerIdBits   = uint64(10)
+	workerIDBits   = uint64(10)
 	sequenceBits   = uint64(12)
-	workerIdShift  = sequenceBits
-	timestampShift = sequenceBits + workerIdBits
+	workerIDShift  = sequenceBits
+	timestampShift = sequenceBits + workerIDBits
 	sequenceMask   = int64(-1) ^ (int64(-1) << sequenceBits)
 
-	// Tue, 21 Mar 2006 20:50:14.000 GMT
-	twepoch = int64(1288834974657)
+	// ( 2012-10-28 16:23:42 UTC ).UnixNano() >> 20
+	twepoch = int64(1288834974288)
 )
 
 var ErrTimeBackwards = errors.New("time has gone backwards")
 var ErrSequenceExpired = errors.New("sequence expired")
+var ErrIDBackwards = errors.New("ID went backward")
 
-var sequence int64
-var lastTimestamp int64
+type guid int64
 
-type GUID int64
+type guidFactory struct {
+	sequence      int64
+	lastTimestamp int64
+	lastID        guid
+}
 
-func NewGUID(workerId int64) (GUID, error) {
-	ts := time.Now().UnixNano() / 1e6
+func (f *guidFactory) NewGUID(workerID int64) (guid, error) {
+	// divide by 1048576, giving pseudo-milliseconds
+	ts := time.Now().UnixNano() >> 20
 
-	if ts < lastTimestamp {
+	if ts < f.lastTimestamp {
 		return 0, ErrTimeBackwards
 	}
 
-	if lastTimestamp == ts {
-		sequence = (sequence + 1) & sequenceMask
-		if sequence == 0 {
+	if f.lastTimestamp == ts {
+		f.sequence = (f.sequence + 1) & sequenceMask
+		if f.sequence == 0 {
 			return 0, ErrSequenceExpired
 		}
 	} else {
-		sequence = 0
+		f.sequence = 0
 	}
 
-	lastTimestamp = ts
+	f.lastTimestamp = ts
 
-	id := ((ts - twepoch) << timestampShift) |
-		(workerId << workerIdShift) |
-		sequence
+	id := guid(((ts - twepoch) << timestampShift) |
+		(workerID << workerIDShift) |
+		f.sequence)
 
-	return GUID(id), nil
+	if id <= f.lastID {
+		return 0, ErrIDBackwards
+	}
+
+	f.lastID = id
+
+	return id, nil
 }
 
-func (g GUID) Hex() nsq.MessageID {
-	var h nsq.MessageID
+func (g guid) Hex() MessageID {
+	var h MessageID
+	var b [8]byte
 
-	b := make([]byte, 8)
 	b[0] = byte(g >> 56)
 	b[1] = byte(g >> 48)
 	b[2] = byte(g >> 40)
@@ -73,6 +83,6 @@ func (g GUID) Hex() nsq.MessageID {
 	b[6] = byte(g >> 8)
 	b[7] = byte(g)
 
-	hex.Encode(h[:], b)
+	hex.Encode(h[:], b[:])
 	return h
 }

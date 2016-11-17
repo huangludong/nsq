@@ -1,50 +1,82 @@
-package main
+package nsqlookupd
 
 import (
-	"github.com/bitly/nsq/util"
-	"log"
+	"fmt"
 	"net"
-	"time"
+	"os"
+	"sync"
+
+	"github.com/nsqio/nsq/internal/http_api"
+	"github.com/nsqio/nsq/internal/protocol"
+	"github.com/nsqio/nsq/internal/util"
+	"github.com/nsqio/nsq/internal/version"
 )
 
 type NSQLookupd struct {
-	tcpAddr                 *net.TCPAddr
-	httpAddr                *net.TCPAddr
-	tcpListener             net.Listener
-	httpListener            net.Listener
-	broadcastAddress        string
-	waitGroup               util.WaitGroupWrapper
-	inactiveProducerTimeout time.Duration
-	tombstoneLifetime       time.Duration
-	DB                      *RegistrationDB
+	sync.RWMutex
+	opts         *Options
+	tcpListener  net.Listener
+	httpListener net.Listener
+	waitGroup    util.WaitGroupWrapper
+	DB           *RegistrationDB
 }
 
-func NewNSQLookupd() *NSQLookupd {
-	return &NSQLookupd{
-		inactiveProducerTimeout: 300 * time.Second,
-		tombstoneLifetime:       45 * time.Second,
-		DB:                      NewRegistrationDB(),
+func New(opts *Options) *NSQLookupd {
+	n := &NSQLookupd{
+		opts: opts,
+		DB:   NewRegistrationDB(),
 	}
+	n.logf(version.String("nsqlookupd"))
+	return n
+}
+
+func (l *NSQLookupd) logf(f string, args ...interface{}) {
+	if l.opts.Logger == nil {
+		return
+	}
+	l.opts.Logger.Output(2, fmt.Sprintf(f, args...))
 }
 
 func (l *NSQLookupd) Main() {
-	context := &Context{l}
+	ctx := &Context{l}
 
-	tcpListener, err := net.Listen("tcp", l.tcpAddr.String())
+	tcpListener, err := net.Listen("tcp", l.opts.TCPAddress)
 	if err != nil {
-		log.Fatalf("FATAL: listen (%s) failed - %s", l.tcpAddr, err.Error())
+		l.logf("FATAL: listen (%s) failed - %s", l.opts.TCPAddress, err)
+		os.Exit(1)
 	}
+	l.Lock()
 	l.tcpListener = tcpListener
-	tcpServer := &tcpServer{context: context}
-	l.waitGroup.Wrap(func() { util.TCPServer(tcpListener, tcpServer) })
+	l.Unlock()
+	tcpServer := &tcpServer{ctx: ctx}
+	l.waitGroup.Wrap(func() {
+		protocol.TCPServer(tcpListener, tcpServer, l.opts.Logger)
+	})
 
-	httpListener, err := net.Listen("tcp", l.httpAddr.String())
+	httpListener, err := net.Listen("tcp", l.opts.HTTPAddress)
 	if err != nil {
-		log.Fatalf("FATAL: listen (%s) failed - %s", l.httpAddr, err.Error())
+		l.logf("FATAL: listen (%s) failed - %s", l.opts.HTTPAddress, err)
+		os.Exit(1)
 	}
+	l.Lock()
 	l.httpListener = httpListener
-	httpServer := &httpServer{context: context}
-	l.waitGroup.Wrap(func() { util.HTTPServer(httpListener, httpServer) })
+	l.Unlock()
+	httpServer := newHTTPServer(ctx)
+	l.waitGroup.Wrap(func() {
+		http_api.Serve(httpListener, httpServer, "HTTP", l.opts.Logger)
+	})
+}
+
+func (l *NSQLookupd) RealTCPAddr() *net.TCPAddr {
+	l.RLock()
+	defer l.RUnlock()
+	return l.tcpListener.Addr().(*net.TCPAddr)
+}
+
+func (l *NSQLookupd) RealHTTPAddr() *net.TCPAddr {
+	l.RLock()
+	defer l.RUnlock()
+	return l.httpListener.Addr().(*net.TCPAddr)
 }
 
 func (l *NSQLookupd) Exit() {

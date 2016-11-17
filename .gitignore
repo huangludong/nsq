@@ -1,18 +1,23 @@
-build
-nsqd/nsqd
-nsqlookupd/nsqlookupd
-nsqreader/nsqreader
-nsqstatsd/nsqstatsd
-nsqadmin/nsqadmin
-examples/bench_reader/bench_reader
-examples/bench_writer/bench_writer
-examples/nsq_to_file/nsq_to_file
-examples/nsq_pubsub/nsq_pubsub
-examples/nsq_to_http/nsq_to_http
-examples/nsq_tail/nsq_tail
-examples/nsq_stat/nsq_stat
+.godeps
+./build
+.cover/
+apps/nsqlookupd/nsqlookupd
+apps/nsqd/nsqd
+apps/nsqadmin/nsqadmin
+bench/bench_reader/bench_reader
+bench/bench_writer/bench_writer
+bench/bench_channels/bench_channels
+apps/nsq_to_nsq/nsq_to_nsq
+apps/nsq_to_file/nsq_to_file
+apps/nsq_pubsub/nsq_pubsub
+apps/nsq_to_http/nsq_to_http
+apps/nsq_tail/nsq_tail
+apps/nsq_stat/nsq_stat
+apps/to_nsq/to_nsq
+nsqadmin/static/build
 dist
 _site
+_posts
 *.dat
 
 # Go.gitignore
@@ -41,3 +46,6 @@ _testmain.go
 *.exe
 
 profile
+
+# vim stuff
+*.sw[op]

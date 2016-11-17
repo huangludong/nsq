@@ -1,7 +1,10 @@
-package main
+package nsqd
 
 import (
 	"sort"
+	"sync/atomic"
+
+	"github.com/nsqio/nsq/internal/quantile"
 )
 
 type TopicStats struct {
@@ -10,6 +13,9 @@ type TopicStats struct {
 	Depth        int64          `json:"depth"`
 	BackendDepth int64          `json:"backend_depth"`
 	MessageCount uint64         `json:"message_count"`
+	Paused       bool           `json:"paused"`
+
+	E2eProcessingLatency *quantile.Result `json:"e2e_processing_latency"`
 }
 
 func NewTopicStats(t *Topic, channels []ChannelStats) TopicStats {
@@ -18,7 +24,10 @@ func NewTopicStats(t *Topic, channels []ChannelStats) TopicStats {
 		Channels:     channels,
 		Depth:        t.Depth(),
 		BackendDepth: t.backend.Depth(),
-		MessageCount: t.messageCount,
+		MessageCount: atomic.LoadUint64(&t.messageCount),
+		Paused:       t.IsPaused(),
+
+		E2eProcessingLatency: t.AggregateChannelE2eProcessingLatency().Result(),
 	}
 }
 
@@ -33,6 +42,8 @@ type ChannelStats struct {
 	TimeoutCount  uint64        `json:"timeout_count"`
 	Clients       []ClientStats `json:"clients"`
 	Paused        bool          `json:"paused"`
+
+	E2eProcessingLatency *quantile.Result `json:"e2e_processing_latency"`
 }
 
 func NewChannelStats(c *Channel, clients []ClientStats) ChannelStats {
@@ -42,25 +53,44 @@ func NewChannelStats(c *Channel, clients []ClientStats) ChannelStats {
 		BackendDepth:  c.backend.Depth(),
 		InFlightCount: len(c.inFlightMessages),
 		DeferredCount: len(c.deferredMessages),
-		MessageCount:  c.messageCount,
-		RequeueCount:  c.requeueCount,
-		TimeoutCount:  c.timeoutCount,
+		MessageCount:  atomic.LoadUint64(&c.messageCount),
+		RequeueCount:  atomic.LoadUint64(&c.requeueCount),
+		TimeoutCount:  atomic.LoadUint64(&c.timeoutCount),
 		Clients:       clients,
 		Paused:        c.IsPaused(),
+
+		E2eProcessingLatency: c.e2eProcessingLatencyStream.Result(),
 	}
 }
 
 type ClientStats struct {
-	Version       string `json:"version"`
-	RemoteAddress string `json:"remote_address"`
-	Name          string `json:"name"`
-	State         int32  `json:"state"`
-	ReadyCount    int64  `json:"ready_count"`
-	InFlightCount int64  `json:"in_flight_count"`
-	MessageCount  uint64 `json:"message_count"`
-	FinishCount   uint64 `json:"finish_count"`
-	RequeueCount  uint64 `json:"requeue_count"`
-	ConnectTime   int64  `json:"connect_ts"`
+	// TODO: deprecated, remove in 1.0
+	Name string `json:"name"`
+
+	ClientID        string `json:"client_id"`
+	Hostname        string `json:"hostname"`
+	Version         string `json:"version"`
+	RemoteAddress   string `json:"remote_address"`
+	State           int32  `json:"state"`
+	ReadyCount      int64  `json:"ready_count"`
+	InFlightCount   int64  `json:"in_flight_count"`
+	MessageCount    uint64 `json:"message_count"`
+	FinishCount     uint64 `json:"finish_count"`
+	RequeueCount    uint64 `json:"requeue_count"`
+	ConnectTime     int64  `json:"connect_ts"`
+	SampleRate      int32  `json:"sample_rate"`
+	Deflate         bool   `json:"deflate"`
+	Snappy          bool   `json:"snappy"`
+	UserAgent       string `json:"user_agent"`
+	Authed          bool   `json:"authed,omitempty"`
+	AuthIdentity    string `json:"auth_identity,omitempty"`
+	AuthIdentityURL string `json:"auth_identity_url,omitempty"`
+
+	TLS                           bool   `json:"tls"`
+	CipherSuite                   string `json:"tls_cipher_suite"`
+	TLSVersion                    string `json:"tls_version"`
+	TLSNegotiatedProtocol         string `json:"tls_negotiated_protocol"`
+	TLSNegotiatedProtocolIsMutual bool   `json:"tls_negotiated_protocol_is_mutual"`
 }
 
 type Topics []*Topic
@@ -85,41 +115,34 @@ type ChannelsByName struct {
 
 func (c ChannelsByName) Less(i, j int) bool { return c.Channels[i].name < c.Channels[j].name }
 
-func (n *NSQd) getStats() []TopicStats {
+func (n *NSQD) GetStats() []TopicStats {
 	n.RLock()
-	defer n.RUnlock()
-
 	realTopics := make([]*Topic, 0, len(n.topicMap))
 	for _, t := range n.topicMap {
 		realTopics = append(realTopics, t)
 	}
+	n.RUnlock()
 	sort.Sort(TopicsByName{realTopics})
-
-	topics := make([]TopicStats, 0, len(n.topicMap))
+	topics := make([]TopicStats, 0, len(realTopics))
 	for _, t := range realTopics {
 		t.RLock()
-
 		realChannels := make([]*Channel, 0, len(t.channelMap))
 		for _, c := range t.channelMap {
 			realChannels = append(realChannels, c)
 		}
+		t.RUnlock()
 		sort.Sort(ChannelsByName{realChannels})
-
-		channels := make([]ChannelStats, 0, len(t.channelMap))
+		channels := make([]ChannelStats, 0, len(realChannels))
 		for _, c := range realChannels {
 			c.RLock()
 			clients := make([]ClientStats, 0, len(c.clients))
 			for _, client := range c.clients {
 				clients = append(clients, client.Stats())
 			}
-			channels = append(channels, NewChannelStats(c, clients))
 			c.RUnlock()
+			channels = append(channels, NewChannelStats(c, clients))
 		}
-
 		topics = append(topics, NewTopicStats(t, channels))
-
-		t.RUnlock()
 	}
-
 	return topics
 }

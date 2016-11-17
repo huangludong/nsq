@@ -1,96 +1,178 @@
-package main
+package nsqadmin
 
 import (
-	"flag"
+	"bytes"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
 	"fmt"
-	"github.com/bitly/nsq/util"
-	"log"
+	"io/ioutil"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
-	"os/signal"
-	"time"
+	"sync"
+	"sync/atomic"
+
+	"github.com/nsqio/nsq/internal/http_api"
+	"github.com/nsqio/nsq/internal/util"
+	"github.com/nsqio/nsq/internal/version"
 )
 
-var (
-	showVersion              = flag.Bool("version", false, "print version string")
-	httpAddress              = flag.String("http-address", "0.0.0.0:4171", "<addr>:<port> to listen on for HTTP clients")
-	templateDir              = flag.String("template-dir", "", "path to templates directory")
-	graphiteUrl              = flag.String("graphite-url", "", "URL to graphite HTTP address")
-	proxyGraphite            = flag.Bool("proxy-graphite", false, "Proxy HTTP requests to graphite")
-	useStatsdPrefixes        = flag.Bool("use-statsd-prefixes", true, "expect statsd prefixed keys in graphite (ie: 'stats_counts.')")
-	statsdInterval           = flag.Duration("statsd-interval", 60*time.Second, "duration of time nsqd is configured to push to statsd (must match)")
-	lookupdHTTPAddrs         = util.StringArray{}
-	nsqdHTTPAddrs            = util.StringArray{}
-	notificationHTTPEndpoint = flag.String("notification-http-endpoint", "", "HTTP endpoint (fully qualified) to which POST notifications of admin actions will be sent")
-)
-
-var notifications chan *AdminAction
-
-func init() {
-	flag.Var(&lookupdHTTPAddrs, "lookupd-http-address", "lookupd HTTP address (may be given multiple times)")
-	flag.Var(&nsqdHTTPAddrs, "nsqd-http-address", "nsqd HTTP address (may be given multiple times)")
+type NSQAdmin struct {
+	sync.RWMutex
+	opts                atomic.Value
+	httpListener        net.Listener
+	waitGroup           util.WaitGroupWrapper
+	notifications       chan *AdminAction
+	graphiteURL         *url.URL
+	httpClientTLSConfig *tls.Config
 }
 
-func main() {
-	var waitGroup util.WaitGroupWrapper
+func New(opts *Options) *NSQAdmin {
+	n := &NSQAdmin{
+		notifications: make(chan *AdminAction),
+	}
+	n.swapOpts(opts)
 
-	flag.Parse()
+	if len(opts.NSQDHTTPAddresses) == 0 && len(opts.NSQLookupdHTTPAddresses) == 0 {
+		n.logf("--nsqd-http-address or --lookupd-http-address required.")
+		os.Exit(1)
+	}
 
-	if *showVersion {
-		fmt.Println(util.Version("nsqadmin"))
+	if len(opts.NSQDHTTPAddresses) != 0 && len(opts.NSQLookupdHTTPAddresses) != 0 {
+		n.logf("use --nsqd-http-address or --lookupd-http-address not both")
+		os.Exit(1)
+	}
+
+	// verify that the supplied address is valid
+	verifyAddress := func(arg string, address string) *net.TCPAddr {
+		addr, err := net.ResolveTCPAddr("tcp", address)
+		if err != nil {
+			n.logf("FATAL: failed to resolve %s address (%s) - %s", arg, address, err)
+			os.Exit(1)
+		}
+		return addr
+	}
+
+	if opts.HTTPClientTLSCert != "" && opts.HTTPClientTLSKey == "" {
+		n.logf("FATAL: --http-client-tls-key must be specified with --http-client-tls-cert")
+		os.Exit(1)
+	}
+
+	if opts.HTTPClientTLSKey != "" && opts.HTTPClientTLSCert == "" {
+		n.logf("FATAL: --http-client-tls-cert must be specified with --http-client-tls-key")
+		os.Exit(1)
+	}
+
+	n.httpClientTLSConfig = &tls.Config{
+		InsecureSkipVerify: opts.HTTPClientTLSInsecureSkipVerify,
+	}
+	if opts.HTTPClientTLSCert != "" && opts.HTTPClientTLSKey != "" {
+		cert, err := tls.LoadX509KeyPair(opts.HTTPClientTLSCert, opts.HTTPClientTLSKey)
+		if err != nil {
+			n.logf("FATAL: failed to LoadX509KeyPair %s, %s - %s",
+				opts.HTTPClientTLSCert, opts.HTTPClientTLSKey, err)
+			os.Exit(1)
+		}
+		n.httpClientTLSConfig.Certificates = []tls.Certificate{cert}
+	}
+	if opts.HTTPClientTLSRootCAFile != "" {
+		tlsCertPool := x509.NewCertPool()
+		caCertFile, err := ioutil.ReadFile(opts.HTTPClientTLSRootCAFile)
+		if err != nil {
+			n.logf("FATAL: failed to read TLS root CA file %s - %s",
+				opts.HTTPClientTLSRootCAFile, err)
+			os.Exit(1)
+		}
+		if !tlsCertPool.AppendCertsFromPEM(caCertFile) {
+			n.logf("FATAL: failed to AppendCertsFromPEM %s", opts.HTTPClientTLSRootCAFile)
+			os.Exit(1)
+		}
+		n.httpClientTLSConfig.RootCAs = tlsCertPool
+	}
+
+	// require that both the hostname and port be specified
+	for _, address := range opts.NSQLookupdHTTPAddresses {
+		verifyAddress("--lookupd-http-address", address)
+	}
+
+	for _, address := range opts.NSQDHTTPAddresses {
+		verifyAddress("--nsqd-http-address", address)
+	}
+
+	if opts.ProxyGraphite {
+		url, err := url.Parse(opts.GraphiteURL)
+		if err != nil {
+			n.logf("FATAL: failed to parse --graphite-url='%s' - %s", opts.GraphiteURL, err)
+			os.Exit(1)
+		}
+		n.graphiteURL = url
+	}
+
+	n.logf(version.String("nsqadmin"))
+
+	return n
+}
+
+func (n *NSQAdmin) logf(f string, args ...interface{}) {
+	if n.getOpts().Logger == nil {
 		return
 	}
+	n.getOpts().Logger.Output(2, fmt.Sprintf(f, args...))
+}
 
-	if *templateDir == "" {
-		for _, defaultPath := range []string{"templates", "/usr/local/share/nsqadmin/templates"} {
-			if info, err := os.Stat(defaultPath); err == nil && info.IsDir() {
-				*templateDir = defaultPath
-				break
-			}
+func (n *NSQAdmin) getOpts() *Options {
+	return n.opts.Load().(*Options)
+}
+
+func (n *NSQAdmin) swapOpts(opts *Options) {
+	n.opts.Store(opts)
+}
+
+func (n *NSQAdmin) RealHTTPAddr() *net.TCPAddr {
+	n.RLock()
+	defer n.RUnlock()
+	return n.httpListener.Addr().(*net.TCPAddr)
+}
+
+func (n *NSQAdmin) handleAdminActions() {
+	for action := range n.notifications {
+		content, err := json.Marshal(action)
+		if err != nil {
+			n.logf("ERROR: failed to serialize admin action - %s", err)
 		}
+		httpclient := &http.Client{
+			Transport: http_api.NewDeadlineTransport(n.getOpts().HTTPClientConnectTimeout, n.getOpts().HTTPClientRequestTimeout),
+		}
+		n.logf("POSTing notification to %s", n.getOpts().NotificationHTTPEndpoint)
+		resp, err := httpclient.Post(n.getOpts().NotificationHTTPEndpoint,
+			"application/json", bytes.NewBuffer(content))
+		if err != nil {
+			n.logf("ERROR: failed to POST notification - %s", err)
+		}
+		resp.Body.Close()
 	}
+}
 
-	if *templateDir == "" {
-		log.Fatalf("--template-dir must be specified (or install the templates to /usr/local/share/nsqadmin/templates)")
-	}
-
-	if len(nsqdHTTPAddrs) == 0 && len(lookupdHTTPAddrs) == 0 {
-		log.Fatalf("--nsqd-http-address or --lookupd-http-address required.")
-	}
-
-	if len(nsqdHTTPAddrs) != 0 && len(lookupdHTTPAddrs) != 0 {
-		log.Fatalf("use --nsqd-http-address or --lookupd-http-address not both")
-	}
-
-	log.Println(util.Version("nsqadmin"))
-
-	exitChan := make(chan int)
-	signalChan := make(chan os.Signal, 1)
-
-	go func() {
-		<-signalChan
-		exitChan <- 1
-	}()
-	signal.Notify(signalChan, os.Interrupt)
-
-	httpAddr, err := net.ResolveTCPAddr("tcp", *httpAddress)
+func (n *NSQAdmin) Main() {
+	httpListener, err := net.Listen("tcp", n.getOpts().HTTPAddress)
 	if err != nil {
-		log.Fatal(err)
+		n.logf("FATAL: listen (%s) failed - %s", n.getOpts().HTTPAddress, err)
+		os.Exit(1)
 	}
+	n.Lock()
+	n.httpListener = httpListener
+	n.Unlock()
+	httpServer := NewHTTPServer(&Context{n})
+	n.waitGroup.Wrap(func() {
+		http_api.Serve(n.httpListener, http_api.CompressHandler(httpServer), "HTTP", n.getOpts().Logger)
+	})
+	n.waitGroup.Wrap(func() { n.handleAdminActions() })
+}
 
-	httpListener, err := net.Listen("tcp", httpAddr.String())
-	if err != nil {
-		log.Fatalf("FATAL: listen (%s) failed - %s", httpAddr, err.Error())
-	}
-	waitGroup.Wrap(func() { httpServer(httpListener) })
-
-	notifications = make(chan *AdminAction)
-	waitGroup.Wrap(func() { HandleAdminActions() })
-
-	<-exitChan
-
-	httpListener.Close()
-	close(notifications)
-
-	waitGroup.Wait()
+func (n *NSQAdmin) Exit() {
+	n.httpListener.Close()
+	close(n.notifications)
+	n.waitGroup.Wait()
 }

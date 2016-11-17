@@ -1,326 +1,336 @@
-package main
+package nsqlookupd
 
 import (
 	"fmt"
-	"github.com/bitly/nsq/nsq"
-	"github.com/bitly/nsq/util"
-	"io"
-	"log"
 	"net/http"
+	"net/http/pprof"
+	"sync/atomic"
+
+	"github.com/julienschmidt/httprouter"
+	"github.com/nsqio/nsq/internal/http_api"
+	"github.com/nsqio/nsq/internal/protocol"
+	"github.com/nsqio/nsq/internal/version"
 )
 
 type httpServer struct {
-	context *Context
+	ctx    *Context
+	router http.Handler
+}
+
+func newHTTPServer(ctx *Context) *httpServer {
+	log := http_api.Log(ctx.nsqlookupd.opts.Logger)
+
+	router := httprouter.New()
+	router.HandleMethodNotAllowed = true
+	router.PanicHandler = http_api.LogPanicHandler(ctx.nsqlookupd.opts.Logger)
+	router.NotFound = http_api.LogNotFoundHandler(ctx.nsqlookupd.opts.Logger)
+	router.MethodNotAllowed = http_api.LogMethodNotAllowedHandler(ctx.nsqlookupd.opts.Logger)
+	s := &httpServer{
+		ctx:    ctx,
+		router: router,
+	}
+
+	router.Handle("GET", "/ping", http_api.Decorate(s.pingHandler, log, http_api.PlainText))
+
+	// v1 negotiate
+	router.Handle("GET", "/debug", http_api.Decorate(s.doDebug, log, http_api.NegotiateVersion))
+	router.Handle("GET", "/lookup", http_api.Decorate(s.doLookup, log, http_api.NegotiateVersion))
+	router.Handle("GET", "/topics", http_api.Decorate(s.doTopics, log, http_api.NegotiateVersion))
+	router.Handle("GET", "/channels", http_api.Decorate(s.doChannels, log, http_api.NegotiateVersion))
+	router.Handle("GET", "/nodes", http_api.Decorate(s.doNodes, log, http_api.NegotiateVersion))
+
+	// only v1
+	router.Handle("POST", "/topic/create", http_api.Decorate(s.doCreateTopic, log, http_api.V1))
+	router.Handle("POST", "/topic/delete", http_api.Decorate(s.doDeleteTopic, log, http_api.V1))
+	router.Handle("POST", "/channel/create", http_api.Decorate(s.doCreateChannel, log, http_api.V1))
+	router.Handle("POST", "/channel/delete", http_api.Decorate(s.doDeleteChannel, log, http_api.V1))
+	router.Handle("POST", "/topic/tombstone", http_api.Decorate(s.doTombstoneTopicProducer, log, http_api.V1))
+
+	// deprecated, v1 negotiate
+	router.Handle("GET", "/info", http_api.Decorate(s.doInfo, log, http_api.NegotiateVersion))
+	router.Handle("POST", "/create_topic", http_api.Decorate(s.doCreateTopic, log, http_api.NegotiateVersion))
+	router.Handle("POST", "/delete_topic", http_api.Decorate(s.doDeleteTopic, log, http_api.NegotiateVersion))
+	router.Handle("POST", "/create_channel", http_api.Decorate(s.doCreateChannel, log, http_api.NegotiateVersion))
+	router.Handle("POST", "/delete_channel", http_api.Decorate(s.doDeleteChannel, log, http_api.NegotiateVersion))
+	router.Handle("POST", "/tombstone_topic_producer", http_api.Decorate(s.doTombstoneTopicProducer, log, http_api.NegotiateVersion))
+	router.Handle("GET", "/create_topic", http_api.Decorate(s.doCreateTopic, log, http_api.NegotiateVersion))
+	router.Handle("GET", "/delete_topic", http_api.Decorate(s.doDeleteTopic, log, http_api.NegotiateVersion))
+	router.Handle("GET", "/create_channel", http_api.Decorate(s.doCreateChannel, log, http_api.NegotiateVersion))
+	router.Handle("GET", "/delete_channel", http_api.Decorate(s.doDeleteChannel, log, http_api.NegotiateVersion))
+	router.Handle("GET", "/tombstone_topic_producer", http_api.Decorate(s.doTombstoneTopicProducer, log, http_api.NegotiateVersion))
+
+	// debug
+	router.HandlerFunc("GET", "/debug/pprof", pprof.Index)
+	router.HandlerFunc("GET", "/debug/pprof/cmdline", pprof.Cmdline)
+	router.HandlerFunc("GET", "/debug/pprof/symbol", pprof.Symbol)
+	router.HandlerFunc("POST", "/debug/pprof/symbol", pprof.Symbol)
+	router.HandlerFunc("GET", "/debug/pprof/profile", pprof.Profile)
+	router.Handler("GET", "/debug/pprof/heap", pprof.Handler("heap"))
+	router.Handler("GET", "/debug/pprof/goroutine", pprof.Handler("goroutine"))
+	router.Handler("GET", "/debug/pprof/block", pprof.Handler("block"))
+	router.Handler("GET", "/debug/pprof/threadcreate", pprof.Handler("threadcreate"))
+
+	return s
 }
 
 func (s *httpServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	switch req.URL.Path {
-	case "/ping":
-		s.pingHandler(w, req)
-	case "/info":
-		s.infoHandler(w, req)
-	case "/lookup":
-		s.lookupHandler(w, req)
-	case "/topics":
-		s.topicsHandler(w, req)
-	case "/channels":
-		s.channelsHandler(w, req)
-	case "/nodes":
-		s.nodesHandler(w, req)
-	case "/delete_topic":
-		s.deleteTopicHandler(w, req)
-	case "/delete_channel":
-		s.deleteChannelHandler(w, req)
-	case "/tombstone_topic_producer":
-		s.tombstoneTopicProducerHandler(w, req)
-	case "/create_topic":
-		s.createTopicHandler(w, req)
-	case "/create_channel":
-		s.createChannelHandler(w, req)
-	case "/debug":
-		s.debugHandler(w, req)
-	default:
-		util.ApiResponse(w, 404, "NOT_FOUND", nil)
-	}
+	s.router.ServeHTTP(w, req)
 }
 
-func (s *httpServer) pingHandler(w http.ResponseWriter, req *http.Request) {
-	w.Header().Set("Content-Length", "2")
-	io.WriteString(w, "OK")
+func (s *httpServer) pingHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	return "OK", nil
 }
 
-func (s *httpServer) topicsHandler(w http.ResponseWriter, req *http.Request) {
-	topics := s.context.nsqlookupd.DB.FindRegistrations("topic", "*", "").Keys()
-	data := make(map[string]interface{})
-	data["topics"] = topics
-	util.ApiResponse(w, 200, "OK", data)
+func (s *httpServer) doInfo(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	return struct {
+		Version string `json:"version"`
+	}{
+		Version: version.Binary,
+	}, nil
 }
 
-func (s *httpServer) channelsHandler(w http.ResponseWriter, req *http.Request) {
-	reqParams, err := util.NewReqParams(req)
+func (s *httpServer) doTopics(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	topics := s.ctx.nsqlookupd.DB.FindRegistrations("topic", "*", "").Keys()
+	return map[string]interface{}{
+		"topics": topics,
+	}, nil
+}
+
+func (s *httpServer) doChannels(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	reqParams, err := http_api.NewReqParams(req)
 	if err != nil {
-		util.ApiResponse(w, 500, "INVALID_REQUEST", nil)
-		return
+		return nil, http_api.Err{400, "INVALID_REQUEST"}
 	}
 
 	topicName, err := reqParams.Get("topic")
 	if err != nil {
-		util.ApiResponse(w, 500, "MISSING_ARG_TOPIC", nil)
-		return
+		return nil, http_api.Err{400, "MISSING_ARG_TOPIC"}
 	}
 
-	channels := s.context.nsqlookupd.DB.FindRegistrations("channel", topicName, "*").SubKeys()
-	data := make(map[string]interface{})
-	data["channels"] = channels
-	util.ApiResponse(w, 200, "OK", data)
+	channels := s.ctx.nsqlookupd.DB.FindRegistrations("channel", topicName, "*").SubKeys()
+	return map[string]interface{}{
+		"channels": channels,
+	}, nil
 }
 
-func (s *httpServer) lookupHandler(w http.ResponseWriter, req *http.Request) {
-	reqParams, err := util.NewReqParams(req)
+func (s *httpServer) doLookup(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	reqParams, err := http_api.NewReqParams(req)
 	if err != nil {
-		util.ApiResponse(w, 500, "INVALID_REQUEST", nil)
-		return
+		return nil, http_api.Err{400, "INVALID_REQUEST"}
 	}
 
 	topicName, err := reqParams.Get("topic")
 	if err != nil {
-		util.ApiResponse(w, 500, "MISSING_ARG_TOPIC", nil)
-		return
+		return nil, http_api.Err{400, "MISSING_ARG_TOPIC"}
 	}
 
-	registration := s.context.nsqlookupd.DB.FindRegistrations("topic", topicName, "")
-
+	registration := s.ctx.nsqlookupd.DB.FindRegistrations("topic", topicName, "")
 	if len(registration) == 0 {
-		util.ApiResponse(w, 500, "INVALID_ARG_TOPIC", nil)
-		return
+		return nil, http_api.Err{404, "TOPIC_NOT_FOUND"}
 	}
 
-	channels := s.context.nsqlookupd.DB.FindRegistrations("channel", topicName, "*").SubKeys()
-	producers := s.context.nsqlookupd.DB.FindProducers("topic", topicName, "")
-	producers = producers.FilterByActive(s.context.nsqlookupd.inactiveProducerTimeout, s.context.nsqlookupd.tombstoneLifetime)
-	data := make(map[string]interface{})
-	data["channels"] = channels
-	data["producers"] = producers.PeerInfo()
-
-	util.ApiResponse(w, 200, "OK", data)
+	channels := s.ctx.nsqlookupd.DB.FindRegistrations("channel", topicName, "*").SubKeys()
+	producers := s.ctx.nsqlookupd.DB.FindProducers("topic", topicName, "")
+	producers = producers.FilterByActive(s.ctx.nsqlookupd.opts.InactiveProducerTimeout,
+		s.ctx.nsqlookupd.opts.TombstoneLifetime)
+	return map[string]interface{}{
+		"channels":  channels,
+		"producers": producers.PeerInfo(),
+	}, nil
 }
 
-func (s *httpServer) createTopicHandler(w http.ResponseWriter, req *http.Request) {
-	reqParams, err := util.NewReqParams(req)
+func (s *httpServer) doCreateTopic(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	reqParams, err := http_api.NewReqParams(req)
 	if err != nil {
-		util.ApiResponse(w, 500, "INVALID_REQUEST", nil)
-		return
+		return nil, http_api.Err{400, "INVALID_REQUEST"}
 	}
 
 	topicName, err := reqParams.Get("topic")
 	if err != nil {
-		util.ApiResponse(w, 500, "MISSING_ARG_TOPIC", nil)
-		return
+		return nil, http_api.Err{400, "MISSING_ARG_TOPIC"}
 	}
 
-	if !nsq.IsValidTopicName(topicName) {
-		util.ApiResponse(w, 500, "INVALID_TOPIC", nil)
-		return
+	if !protocol.IsValidTopicName(topicName) {
+		return nil, http_api.Err{400, "INVALID_ARG_TOPIC"}
 	}
 
-	log.Printf("DB: adding topic(%s)", topicName)
+	s.ctx.nsqlookupd.logf("DB: adding topic(%s)", topicName)
 	key := Registration{"topic", topicName, ""}
-	s.context.nsqlookupd.DB.AddRegistration(key)
+	s.ctx.nsqlookupd.DB.AddRegistration(key)
 
-	util.ApiResponse(w, 200, "OK", nil)
+	return nil, nil
 }
 
-func (s *httpServer) deleteTopicHandler(w http.ResponseWriter, req *http.Request) {
-	reqParams, err := util.NewReqParams(req)
+func (s *httpServer) doDeleteTopic(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	reqParams, err := http_api.NewReqParams(req)
 	if err != nil {
-		util.ApiResponse(w, 500, "INVALID_REQUEST", nil)
-		return
+		return nil, http_api.Err{400, "INVALID_REQUEST"}
 	}
 
 	topicName, err := reqParams.Get("topic")
 	if err != nil {
-		util.ApiResponse(w, 500, "MISSING_ARG_TOPIC", nil)
-		return
+		return nil, http_api.Err{400, "MISSING_ARG_TOPIC"}
 	}
 
-	registrations := s.context.nsqlookupd.DB.FindRegistrations("channel", topicName, "*")
+	registrations := s.ctx.nsqlookupd.DB.FindRegistrations("channel", topicName, "*")
 	for _, registration := range registrations {
-		log.Printf("DB: removing channel(%s) from topic(%s)", registration.SubKey, topicName)
-		s.context.nsqlookupd.DB.RemoveRegistration(registration)
+		s.ctx.nsqlookupd.logf("DB: removing channel(%s) from topic(%s)", registration.SubKey, topicName)
+		s.ctx.nsqlookupd.DB.RemoveRegistration(registration)
 	}
 
-	registrations = s.context.nsqlookupd.DB.FindRegistrations("topic", topicName, "")
+	registrations = s.ctx.nsqlookupd.DB.FindRegistrations("topic", topicName, "")
 	for _, registration := range registrations {
-		log.Printf("DB: removing topic(%s)", topicName)
-		s.context.nsqlookupd.DB.RemoveRegistration(registration)
+		s.ctx.nsqlookupd.logf("DB: removing topic(%s)", topicName)
+		s.ctx.nsqlookupd.DB.RemoveRegistration(registration)
 	}
 
-	util.ApiResponse(w, 200, "OK", nil)
+	return nil, nil
 }
 
-func (s *httpServer) tombstoneTopicProducerHandler(w http.ResponseWriter, req *http.Request) {
-	reqParams, err := util.NewReqParams(req)
+func (s *httpServer) doTombstoneTopicProducer(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	reqParams, err := http_api.NewReqParams(req)
 	if err != nil {
-		util.ApiResponse(w, 500, "INVALID_REQUEST", nil)
-		return
+		return nil, http_api.Err{400, "INVALID_REQUEST"}
 	}
 
 	topicName, err := reqParams.Get("topic")
 	if err != nil {
-		util.ApiResponse(w, 500, "MISSING_ARG_TOPIC", nil)
-		return
+		return nil, http_api.Err{400, "MISSING_ARG_TOPIC"}
 	}
 
 	node, err := reqParams.Get("node")
 	if err != nil {
-		util.ApiResponse(w, 500, "MISSING_ARG_NODE", nil)
-		return
+		return nil, http_api.Err{400, "MISSING_ARG_NODE"}
 	}
 
-	log.Printf("DB: setting tombstone for producer@%s of topic(%s)", node, topicName)
-	producers := s.context.nsqlookupd.DB.FindProducers("topic", topicName, "")
+	s.ctx.nsqlookupd.logf("DB: setting tombstone for producer@%s of topic(%s)", node, topicName)
+	producers := s.ctx.nsqlookupd.DB.FindProducers("topic", topicName, "")
 	for _, p := range producers {
-		thisNode := fmt.Sprintf("%s:%d", p.peerInfo.BroadcastAddress, p.peerInfo.HttpPort)
+		thisNode := fmt.Sprintf("%s:%d", p.peerInfo.BroadcastAddress, p.peerInfo.HTTPPort)
 		if thisNode == node {
 			p.Tombstone()
 		}
 	}
 
-	util.ApiResponse(w, 200, "OK", nil)
+	return nil, nil
 }
 
-func (s *httpServer) createChannelHandler(w http.ResponseWriter, req *http.Request) {
-	reqParams, err := util.NewReqParams(req)
+func (s *httpServer) doCreateChannel(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	reqParams, err := http_api.NewReqParams(req)
 	if err != nil {
-		util.ApiResponse(w, 500, "INVALID_REQUEST", nil)
-		return
+		return nil, http_api.Err{400, "INVALID_REQUEST"}
 	}
 
-	topicName, channelName, err := util.GetTopicChannelArgs(reqParams)
+	topicName, channelName, err := http_api.GetTopicChannelArgs(reqParams)
 	if err != nil {
-		util.ApiResponse(w, 500, err.Error(), nil)
-		return
+		return nil, http_api.Err{400, err.Error()}
 	}
 
-	log.Printf("DB: adding channel(%s) in topic(%s)", channelName, topicName)
+	s.ctx.nsqlookupd.logf("DB: adding channel(%s) in topic(%s)", channelName, topicName)
 	key := Registration{"channel", topicName, channelName}
-	s.context.nsqlookupd.DB.AddRegistration(key)
+	s.ctx.nsqlookupd.DB.AddRegistration(key)
 
-	log.Printf("DB: adding topic(%s)", topicName)
+	s.ctx.nsqlookupd.logf("DB: adding topic(%s)", topicName)
 	key = Registration{"topic", topicName, ""}
-	s.context.nsqlookupd.DB.AddRegistration(key)
+	s.ctx.nsqlookupd.DB.AddRegistration(key)
 
-	util.ApiResponse(w, 200, "OK", nil)
+	return nil, nil
 }
 
-func (s *httpServer) deleteChannelHandler(w http.ResponseWriter, req *http.Request) {
-	reqParams, err := util.NewReqParams(req)
+func (s *httpServer) doDeleteChannel(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	reqParams, err := http_api.NewReqParams(req)
 	if err != nil {
-		util.ApiResponse(w, 500, "INVALID_REQUEST", nil)
-		return
+		return nil, http_api.Err{400, "INVALID_REQUEST"}
 	}
 
-	topicName, channelName, err := util.GetTopicChannelArgs(reqParams)
+	topicName, channelName, err := http_api.GetTopicChannelArgs(reqParams)
 	if err != nil {
-		util.ApiResponse(w, 500, err.Error(), nil)
-		return
+		return nil, http_api.Err{400, err.Error()}
 	}
 
-	registrations := s.context.nsqlookupd.DB.FindRegistrations("channel", topicName, channelName)
+	registrations := s.ctx.nsqlookupd.DB.FindRegistrations("channel", topicName, channelName)
 	if len(registrations) == 0 {
-		util.ApiResponse(w, 404, "NOT_FOUND", nil)
-		return
+		return nil, http_api.Err{404, "CHANNEL_NOT_FOUND"}
 	}
 
-	log.Printf("DB: removing channel(%s) from topic(%s)", channelName, topicName)
+	s.ctx.nsqlookupd.logf("DB: removing channel(%s) from topic(%s)", channelName, topicName)
 	for _, registration := range registrations {
-		s.context.nsqlookupd.DB.RemoveRegistration(registration)
+		s.ctx.nsqlookupd.DB.RemoveRegistration(registration)
 	}
 
-	util.ApiResponse(w, 200, "OK", nil)
+	return nil, nil
 }
 
-// note: we can't embed the *Producer here because embeded objects are ignored for json marshalling
 type node struct {
 	RemoteAddress    string   `json:"remote_address"`
-	Address          string   `json:"address"` //TODO: drop for 1.0
 	Hostname         string   `json:"hostname"`
 	BroadcastAddress string   `json:"broadcast_address"`
-	TcpPort          int      `json:"tcp_port"`
-	HttpPort         int      `json:"http_port"`
+	TCPPort          int      `json:"tcp_port"`
+	HTTPPort         int      `json:"http_port"`
 	Version          string   `json:"version"`
 	Tombstones       []bool   `json:"tombstones"`
 	Topics           []string `json:"topics"`
 }
 
-func (s *httpServer) nodesHandler(w http.ResponseWriter, req *http.Request) {
+func (s *httpServer) doNodes(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
 	// dont filter out tombstoned nodes
-	producers := s.context.nsqlookupd.DB.FindProducers("client", "", "").FilterByActive(s.context.nsqlookupd.inactiveProducerTimeout, 0)
+	producers := s.ctx.nsqlookupd.DB.FindProducers("client", "", "").FilterByActive(
+		s.ctx.nsqlookupd.opts.InactiveProducerTimeout, 0)
 	nodes := make([]*node, len(producers))
 	for i, p := range producers {
-		topics := s.context.nsqlookupd.DB.LookupRegistrations(p.peerInfo.id).Filter("topic", "*", "").Keys()
+		topics := s.ctx.nsqlookupd.DB.LookupRegistrations(p.peerInfo.id).Filter("topic", "*", "").Keys()
 
 		// for each topic find the producer that matches this peer
 		// to add tombstone information
 		tombstones := make([]bool, len(topics))
 		for j, t := range topics {
-			topicProducers := s.context.nsqlookupd.DB.FindProducers("topic", t, "")
+			topicProducers := s.ctx.nsqlookupd.DB.FindProducers("topic", t, "")
 			for _, tp := range topicProducers {
 				if tp.peerInfo == p.peerInfo {
-					tombstones[j] = tp.IsTombstoned(s.context.nsqlookupd.tombstoneLifetime)
+					tombstones[j] = tp.IsTombstoned(s.ctx.nsqlookupd.opts.TombstoneLifetime)
 				}
 			}
 		}
 
 		nodes[i] = &node{
 			RemoteAddress:    p.peerInfo.RemoteAddress,
-			Address:          p.peerInfo.Address, //TODO: drop for 1.0
 			Hostname:         p.peerInfo.Hostname,
 			BroadcastAddress: p.peerInfo.BroadcastAddress,
-			TcpPort:          p.peerInfo.TcpPort,
-			HttpPort:         p.peerInfo.HttpPort,
+			TCPPort:          p.peerInfo.TCPPort,
+			HTTPPort:         p.peerInfo.HTTPPort,
 			Version:          p.peerInfo.Version,
 			Tombstones:       tombstones,
 			Topics:           topics,
 		}
 	}
 
-	data := make(map[string]interface{})
-	data["producers"] = nodes
-	util.ApiResponse(w, 200, "OK", data)
+	return map[string]interface{}{
+		"producers": nodes,
+	}, nil
 }
 
-func (s *httpServer) infoHandler(w http.ResponseWriter, req *http.Request) {
-	util.ApiResponse(w, 200, "OK", struct {
-		Version string `json:"version"`
-	}{
-		Version: util.BINARY_VERSION,
-	})
-}
-
-func (s *httpServer) debugHandler(w http.ResponseWriter, req *http.Request) {
-	s.context.nsqlookupd.DB.RLock()
-	defer s.context.nsqlookupd.DB.RUnlock()
+func (s *httpServer) doDebug(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	s.ctx.nsqlookupd.DB.RLock()
+	defer s.ctx.nsqlookupd.DB.RUnlock()
 
 	data := make(map[string][]map[string]interface{})
-	for r, producers := range s.context.nsqlookupd.DB.registrationMap {
+	for r, producers := range s.ctx.nsqlookupd.DB.registrationMap {
 		key := r.Category + ":" + r.Key + ":" + r.SubKey
-		data[key] = make([]map[string]interface{}, 0)
 		for _, p := range producers {
-			m := make(map[string]interface{})
-			m["id"] = p.peerInfo.id
-			m["address"] = p.peerInfo.Address //TODO: remove for 1.0
-			m["hostname"] = p.peerInfo.Hostname
-			m["broadcast_address"] = p.peerInfo.BroadcastAddress
-			m["tcp_port"] = p.peerInfo.TcpPort
-			m["http_port"] = p.peerInfo.HttpPort
-			m["version"] = p.peerInfo.Version
-			m["last_update"] = p.peerInfo.lastUpdate.UnixNano()
-			m["tombstoned"] = p.tombstoned
-			m["tombstoned_at"] = p.tombstonedAt.UnixNano()
+			m := map[string]interface{}{
+				"id":                p.peerInfo.id,
+				"hostname":          p.peerInfo.Hostname,
+				"broadcast_address": p.peerInfo.BroadcastAddress,
+				"tcp_port":          p.peerInfo.TCPPort,
+				"http_port":         p.peerInfo.HTTPPort,
+				"version":           p.peerInfo.Version,
+				"last_update":       atomic.LoadInt64(&p.peerInfo.lastUpdate),
+				"tombstoned":        p.tombstoned,
+				"tombstoned_at":     p.tombstonedAt.UnixNano(),
+			}
 			data[key] = append(data[key], m)
 		}
 	}
 
-	util.ApiResponse(w, 200, "OK", data)
+	return data, nil
 }
